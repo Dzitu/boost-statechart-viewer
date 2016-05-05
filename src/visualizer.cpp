@@ -35,6 +35,8 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+#include <clang/Basic/DiagnosticIDs.h>
+#include <signal.h>
 
 using namespace clang;
 using namespace std;
@@ -130,13 +132,13 @@ namespace Model
     class Transition
     {
     public:
-	const string src, dst, event;
-	Transition(string src, string dst, string event) : src(src), dst(dst), event(event) {}
+	const string src, dst, event, guard;
+	Transition(string src, string dst, string event, string g) : src(src), dst(dst), event(event), guard(g) {}
     };
 
     ostream& operator<<(ostream& os, const Transition& t)
     {
-	os << indent << t.src << " -> " << t.dst << " [label = \"" << t.event << "\"]\n";
+	os << indent << t.src << " -> " << t.dst << " [label = \"" << t.event << (t.guard != "" ? (" [" + t.guard + "]") : "") << "\"]\n";
 	return os;
     }
 
@@ -262,9 +264,33 @@ class FindTransitVisitor : public RecursiveASTVisitor<FindTransitVisitor>
     Model::Model &model;
     const CXXRecordDecl *SrcState;
     const Type *EventType;
+    std::vector<Stmt *> statements;
+    ASTContext * astContext;
 public:
-    explicit FindTransitVisitor(Model::Model &model, const CXXRecordDecl *SrcState, const Type *EventType)
-	: model(model), SrcState(SrcState), EventType(EventType) {}
+    explicit FindTransitVisitor(Model::Model &model, const CXXRecordDecl *SrcState, const Type *EventType, ASTContext* ast)
+	: model(model), SrcState(SrcState), EventType(EventType), astContext(ast) {}
+
+    bool TraverseStmt(Stmt* s)
+    {
+        if(s && isa<IfStmt>(s)) {
+            if(s && statements.size() && statements.back() && s == static_cast<IfStmt*>(statements.back())->getElse())
+            {
+                statements.pop_back();
+                statements.push_back(0);
+            }
+            statements.push_back(s);
+        }
+        else if(s && statements.size() && statements.back() && s == static_cast<IfStmt*>(statements.back())->getElse())
+        {
+            statements.pop_back();
+            statements.push_back(0);
+        }
+        auto val = RecursiveASTVisitor<FindTransitVisitor>::TraverseStmt(s);
+        if(s && isa<IfStmt>(s)) {
+            statements.pop_back();
+        }
+        return val;
+    }
 
     bool VisitMemberExpr(MemberExpr *E) {
 	if (E->getMemberNameInfo().getAsString() == "defer_event") {
@@ -279,7 +305,22 @@ public:
 	    const Type *DstStateType = E->getExplicitTemplateArgs()[0].getArgument().getAsType().getTypePtr();
 	    CXXRecordDecl *DstState = DstStateType->getAsCXXRecordDecl();
 	    CXXRecordDecl *Event = EventType->getAsCXXRecordDecl();
-	    Model::Transition *T = new Model::Transition(SrcState->getName(), DstState->getName(), Event->getName());
+            clang::LangOptions LangOpts;
+            LangOpts.CPlusPlus = true;
+            clang::PrintingPolicy Policy(LangOpts);
+            std::string guard;
+            std::string separator;
+            for(auto stmt : statements)
+            {
+                if(stmt && isa<IfStmt>(stmt)) {
+                    std::string TypeS;
+                    llvm::raw_string_ostream s(TypeS);
+                    static_cast<IfStmt*>(stmt)->getCond()->printPretty(s, 0, Policy);
+                    guard += separator + s.str();
+                    separator = " && ";
+                }
+            }
+	    Model::Transition *T = new Model::Transition(SrcState->getName(), DstState->getName(), Event->getName(), guard);
 	    model.transitions.push_back(T);
 	}
 	return true;
@@ -362,7 +403,7 @@ public:
 		    if (ParmType->isLValueReferenceType())
 			ParmType = dyn_cast<LValueReferenceType>(ParmType)->getPointeeType().getTypePtr();
 		    if (ParmType == EventType) {
-			FindTransitVisitor(model, SrcState, EventType).TraverseStmt(React->getBody());
+			FindTransitVisitor(model, SrcState, EventType, ASTCtx).TraverseStmt(React->getBody());
 			reactMethodInReactions[i] = true;
 			return true;
 		    }
@@ -391,7 +432,7 @@ public:
 		CXXRecordDecl *DstState = DstStateType->getAsCXXRecordDecl();
 		unusedEvents.remove_if(eventHasName(Event->getNameAsString()));
 
-		Model::Transition *T = new Model::Transition(SrcState->getName(), DstState->getName(), Event->getName());
+		Model::Transition *T = new Model::Transition(SrcState->getName(), DstState->getName(), Event->getName(), "");
 		model.transitions.push_back(T);
 	    } else if (name == "boost::statechart::custom_reaction") {
 		const Type *EventType = TST->getArg(0).getAsType().getTypePtr();
@@ -603,7 +644,7 @@ protected:
       if (args[i] == "-an-error") {
         DiagnosticsEngine &D = CI.getDiagnostics();
         unsigned DiagID = D.getCustomDiagID(
-          DiagnosticsEngine::Error, "invalid argument '" + args[i] + "'");
+          DiagnosticsEngine::Error, "invalid argument");
         D.Report(DiagID);
         return false;
       }
